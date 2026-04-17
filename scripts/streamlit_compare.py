@@ -30,16 +30,48 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 
 from video_quality_metrics import compute_metrics_board  # noqa: E402
 
+def _resolve_ci(base: Path, *parts: str) -> Path:
+    """Join ``parts`` under ``base`` resolving each segment case-insensitively.
+
+    JIGSAWS ships with capital-S ``Suturing/`` and mixed-case
+    ``Experimental_setup/`` on disk, but older code here hard-coded
+    lowercase.  macOS filesystems are case-insensitive so that worked
+    locally; Linux (Colab) is case-sensitive and fails.  This resolver
+    walks segment-by-segment and returns the first child whose name
+    matches ignoring case.  If no real child matches, it falls back to
+    the literal join so callers still get a path they can test with
+    ``.exists()`` and surface in error messages.
+    """
+    cur = base
+    for seg in parts:
+        if not cur.is_dir():
+            return cur.joinpath(*parts[parts.index(seg):])
+        match: Optional[Path] = None
+        try:
+            for child in cur.iterdir():
+                if child.name == seg:
+                    match = child
+                    break
+                if match is None and child.name.lower() == seg.lower():
+                    match = child
+        except OSError:
+            return cur.joinpath(*parts[parts.index(seg):])
+        if match is None:
+            return cur.joinpath(*parts[parts.index(seg):])
+        cur = match
+    return cur
+
+
 DATA_ROOT = REPO_ROOT / "data" / "gdrive_cache"
-VIDEO_DIR = DATA_ROOT / "suturing" / "video"
-META_FILE = DATA_ROOT / "suturing" / "meta_file_Suturing.txt"
-EXP_SETUP_ROOT = (
-    DATA_ROOT
-    / "Experimental_setup"
-    / "suturing"
-    / "balanced"
-    / "gestureclassification"
-    / "onetrialout"
+VIDEO_DIR = _resolve_ci(DATA_ROOT, "suturing", "video")
+META_FILE = _resolve_ci(DATA_ROOT, "suturing", "meta_file_Suturing.txt")
+EXP_SETUP_ROOT = _resolve_ci(
+    DATA_ROOT,
+    "Experimental_setup",
+    "suturing",
+    "balanced",
+    "gestureclassification",
+    "onetrialout",
 )
 CHECKPOINTS_ROOT = REPO_ROOT / "checkpoints"
 OUTPUT_ROOT = REPO_ROOT / "outputs" / "eval_video" / "streamlit_runs"
@@ -703,8 +735,15 @@ def main() -> None:
 
     if not trials:
         st.error(
-            f"No suturing videos found under `{VIDEO_DIR}`. "
-            "Make sure the JIGSAWS data is synced into `data/gdrive_cache/`."
+            f"No suturing videos found under `{VIDEO_DIR}`.\n\n"
+            f"- DATA_ROOT: `{DATA_ROOT}` (exists={DATA_ROOT.is_dir()})\n"
+            f"- VIDEO_DIR: `{VIDEO_DIR}` (exists={VIDEO_DIR.is_dir()})\n"
+            f"- META_FILE: `{META_FILE}` (exists={META_FILE.exists()})\n"
+            f"- EXP_SETUP_ROOT: `{EXP_SETUP_ROOT}` (exists={EXP_SETUP_ROOT.is_dir()})\n\n"
+            "Make sure the JIGSAWS tree (with `Suturing/` and "
+            "`Experimental_setup/`) is symlinked into "
+            "`<repo>/data/gdrive_cache/`. Path segments are resolved "
+            "case-insensitively, so `Suturing` vs `suturing` is fine."
         )
         return
     if not checkpoints:
