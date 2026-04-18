@@ -1,21 +1,113 @@
-# Suturing Stable Diffusion Pipeline
+# SS-SD: Kinematic-Conditioned Stable Diffusion for Surgical Suturing
 
-Clean, modular pipeline for surgical suturing analysis and synthesis:
+This project fine-tunes Stable Diffusion 1.5 to generate JIGSAWS
+**Suturing** video frames directly from surgical robot kinematics and
+gesture labels — no text prompts.
 
-1. Data ingestion and modality alignment (video + kinematics + transcription)
-2. Detection and overlay export
-3. Kinematic feature engineering (velocity, acceleration, jerk)
-4. ControlNet/SVD-ready synthesis scaffolding
-5. Synchronized comparison dashboard
+The CLIP text encoder is **replaced entirely** by a small
+`KinematicEncoder` that projects a 76-dim kinematics vector plus an
+integer gesture label into the U-Net's cross-attention space. The U-Net
+is then adapted with LoRA on its cross-attention projections
+(`to_q/to_k/to_v/to_out.0`). The VAE stays frozen.
+
+```
+kinematics (76-dim)  ─┐
+                       ├─► KinematicEncoder ─► [B, 77, 768] ──► SD U-Net (LoRA) ──► latent ──► VAE.decode ──► RGB frame
+gesture id (int)     ─┘                                          ▲
+                                                                 │
+                                                         noisy latent + timestep
+```
+
+Only the JIGSAWS `Suturing` task is supported. The other JIGSAWS tasks
+do not ship aligned kinematics usable by this pipeline.
+
+## What Actually Runs
+
+The real training + evaluation loop lives under `scripts/` and
+`src/suturing_pipeline/`. The original notebook-based "phase" layout
+(detection, kinematics, dashboard) is still in-tree as secondary
+tooling, but the main pipeline is the SD-generation stack described
+below.
+
+### Core pipeline (SD generation)
+
+| Stage                    | Script                           | What it does |
+| ------------------------ | -------------------------------- | ------------ |
+| Pull JIGSAWS from Drive  | `scripts/download_jigsaws.py`    | Mirrors the JIGSAWS Drive folder (kinematics, transcriptions, meta files, `Experimental_setup/`, videos) into `data/gdrive_cache/`. |
+| Train                    | `scripts/train_sd.py`            | VAE-encode frames → add noise → predict noise with LoRA-adapted U-Net conditioned on `KinematicEncoder(kin, gesture)`. Saves `step_*.pt` checkpoints with LoRA weights, encoder weights, scaler params, and `gesture_to_int` mapping. |
+| Single-frame inference   | `scripts/inference_sd.py`        | Loads a checkpoint and generates one PNG for a given kinematics row + gesture id. |
+| Real-vs-generated grid   | `scripts/generate_eval_grid.py`  | Balanced sample across gestures on the held-out split → `eval_grid.png` (real \| generated) + optional `gesture_sweep.png` (fixed kinematics, varied gesture). |
+| Real-vs-generated video  | `scripts/generate_eval_video.py` | Walks a contiguous range of frames from one held-out trial and writes `real.mp4`, `generated.mp4`, `sidebyside.mp4`. |
+| Metrics on a grid image  | `scripts/metrics_on_grid.py`     | PSNR / SSIM / histogram / edge-IoU on the exported grid, including cross-pair baselines to check the model is tracking conditioning rather than scene average. |
+| Metrics on a clip pair   | `scripts/video_quality_metrics.py` | SSIM + Farneback optical-flow motion profile, flags flicker/jump windows with plain-language reasons. |
+| Interactive comparison   | `scripts/streamlit_compare.py`   | Streamlit UI: pick a checkpoint + trial + clip length, shells out to `generate_eval_video.py`, embeds the resulting MP4s and the metrics board. |
+
+### Diagnostics
+
+These answer *"is the pipeline broken, or is it just undertrained?"*
+before burning GPU hours.
+
+- `scripts/diagnose_vae.py` — runs real frames through the frozen SD
+  VAE (encode → decode) and reports per-image PSNR. This is the
+  **ceiling** of the stack; the generator cannot exceed VAE fidelity
+  without also fine-tuning the VAE on surgical frames.
+- `scripts/overfit_one_frame.py` — trains a fresh LoRA +
+  `KinematicEncoder` on a single `(frame, kinematics, gesture)` tuple
+  and snapshots generation over training. If this cannot memorise one
+  frame, the wiring is wrong; if it can, the "messy output" problem is
+  about data scale / steps / resolution, not the loop.
+
+Output artefacts land under `outputs/diagnostics/...`.
+
+### Secondary tooling (not part of the generation loop)
+
+These scripts pre-date the SD pipeline and are retained for
+exploratory / labeling work. They are **not** required for training or
+evaluating the generator.
+
+- `scripts/prepare_trials.py` — trial discovery and modality linking
+  into `outputs/trial_index.csv`.
+- `scripts/prepare_labeling_set.py`, `scripts/train_yolo.py`,
+  `scripts/run_detection.py` — YOLO labeling bootstrap + detector
+  training + detection export.
+- `scripts/compute_kinematics.py` — velocity / acceleration / jerk
+  features.
+- `scripts/run_synthesis.py`, `scripts/launch_dashboard.py` — original
+  ControlNet/SVD scaffolding and comparison dashboard from the earlier
+  notebook baseline.
 
 ## Repository Layout
 
-- `versions/` immutable notebook snapshots
-- `notebooks/` phase-based exploratory notebooks
-- `src/suturing_pipeline/` reusable Python package
-- `scripts/` CLI entry points for each phase
-- `configs/` project configuration files
-- `tests/` initial unit tests
+```
+src/suturing_pipeline/
+  data/
+    jigsaws_dataset.py        # PyTorch Dataset: lazy video frames + aligned kin + gesture
+    data_utils.py             # kinematics / transcription / split parsing
+    loader.py                 # Google Drive OAuth + cache materialisation
+    alignment.py              # modality alignment helpers
+  synthesis/
+    kinematic_encoder.py      # 76-dim kin + gesture -> [B, 77, 768]
+    sd_sampler.py             # load ckpt once, call .sample() per frame
+    controlnet_pipeline.py    # (legacy scaffold)
+  detection/                  # YOLO labeling + training + export (secondary)
+  kinematics/                 # feature engineering (secondary)
+  sequence/                   # temporal model components (secondary)
+  dashboard/                  # original comparison dashboard (secondary)
+scripts/                      # CLI entry points for every stage above
+notebooks/
+  colab_train_sd.ipynb        # GPU training on Colab
+  01_..04_*.ipynb             # earlier phase notebooks
+checkpoints/                  # LoRA checkpoints (e.g. suturing_expert_lora/step_1480.pt)
+data/gdrive_cache/            # materialised JIGSAWS mirror
+outputs/
+  eval/                       # real-vs-generated grids
+  eval_video/                 # clip comparisons + streamlit runs
+  diagnostics/                # VAE ceiling + one-frame overfit
+configs/base.yaml             # ingestion + legacy detection / kinematics config
+```
+
+Immutable snapshots of the original notebook are kept under
+`versions/`.
 
 ## Quickstart
 
@@ -25,125 +117,154 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Run individual phases:
+### 1. Pull JIGSAWS into the local cache
+
+The project reads JIGSAWS through a Google Drive OAuth client. Drop
+your `google_oauth_client.json` under `./secrets/` (see
+[Google Drive OAuth](#google-drive-oauth-setup) below), then:
 
 ```bash
-python scripts/prepare_trials.py --config configs/base.yaml
-python scripts/run_detection.py --config configs/base.yaml
-python scripts/compute_kinematics.py --config configs/base.yaml
-python scripts/run_synthesis.py --config configs/base.yaml
-python scripts/launch_dashboard.py --config configs/base.yaml
+python scripts/download_jigsaws.py
 ```
 
-Prepare a labeling set from your `trial_index.csv` videos (works with your
-Google Drive materialized cache paths):
+This mirrors the Drive folder into `data/gdrive_cache/` so every other
+script sees normal file paths.
+
+### 2. Train
+
+Recommended (Colab / GPU). Notebook: `notebooks/colab_train_sd.ipynb`.
+CLI form:
 
 ```bash
-python scripts/prepare_labeling_set.py \
-  --trial-index ./outputs/trial_index.csv \
-  --output-root ./data/suturing_yolo \
-  --tasks "Suturing,Needle_Passing" \
-  --capture capture2 \
-  --frames-per-trial 30 \
-  --sampling uniform
-```
-
-This creates:
-
-- `data/suturing_yolo/images/train/*.jpg`
-- `data/suturing_yolo/images/val/*.jpg`
-- `data/suturing_yolo/labels/train/*.txt` (empty placeholders)
-- `data/suturing_yolo/labels/val/*.txt` (empty placeholders)
-- `data/suturing_yolo/manifests/labeling_manifest.csv`
-
-Labeling workflow:
-
-1. Import `images/train` and `images/val` into CVAT or Label Studio.
-2. Annotate with your class list (for example: `needle_head`).
-3. Export YOLO labels and place `.txt` files back into matching `labels/train`
-   and `labels/val` paths with the same stem as each image.
-4. Train with `scripts/train_yolo.py`.
-
-Train a custom YOLO detector (from labeled suturing frames in YOLO format):
-
-```bash
-python scripts/train_yolo.py \
-  --dataset-root ./data/suturing_yolo \
-  --classes "needle_head,needle_driver,forceps,thread,left_tool,right_tool,tissue_region" \
-  --base-weights yolov8n.pt \
+python scripts/train_sd.py \
+  --data_root ./data/gdrive_cache \
+  --expert_only \
+  --train_mode lora \
+  --image_size 256 \
+  --capture 1 \
+  --frame_stride 30 \
+  --batch_size 4 \
+  --lr 1e-4 \
   --epochs 50 \
-  --imgsz 640 \
-  --batch 16
+  --save_every 500 \
+  --save_dir ./checkpoints/suturing_expert_lora
 ```
 
-Expected dataset structure for training:
+Each saved checkpoint bundles LoRA state, `KinematicEncoder` weights,
+the `StandardScaler` params used at training time, and the
+`gesture_to_int` vocabulary, so evaluation scripts are fully
+self-contained given a single `.pt` file.
 
-- `data/suturing_yolo/images/train/*.jpg`
-- `data/suturing_yolo/images/val/*.jpg`
-- `data/suturing_yolo/labels/train/*.txt`
-- `data/suturing_yolo/labels/val/*.txt`
-
-After training, set `detection.yolo_weights` in `configs/base.yaml` to the printed
-`best.pt` path and keep `detection.target_class_names` aligned to your trained labels.
-
-### Detection Model Note
-
-The default `yolov8n.pt` is a generic COCO model and will not detect
-suturing-specific targets (for example, needle heads) reliably. Point
-`detection.yolo_weights` to a domain-trained model whose labels include your
-needle class names, and configure:
-
-- `detection.target_class_names` (for example: `["needle_head"]`)
-- `detection.strict_target_class_names: true` to fail fast when labels do not match
-
-## Google Drive OAuth Setup (Primary Ingestion Path)
-
-The default config now uses Google Drive API access for trial discovery.
-
-1. Place your downloaded OAuth client secret JSON at:
-   - `./secrets/google_oauth_client.json`
-2. Keep `configs/base.yaml` as-is or set:
-   - `ingestion.source: gdrive`
-   - `ingestion.gdrive.credentials_path` to your JSON file
-   - `ingestion.gdrive.oauth_flow: console` (prints auth URL in terminal; no auto-open browser)
-   - optional `ingestion.gdrive.root_folder_id` (recommended if folder names are ambiguous)
-   - optional `ingestion.gdrive.materialize_local: true` to download indexed files into cache
-   - optional `ingestion.gdrive.cache_dir` for local cache location
-3. Run ingestion:
+### 3. Evaluate
 
 ```bash
-python scripts/prepare_trials.py --config configs/base.yaml
+python scripts/generate_eval_grid.py \
+  --checkpoint checkpoints/suturing_expert_lora/step_1480.pt \
+  --data_root  ./data/gdrive_cache \
+  --num_samples 12 --num_inference_steps 25
+
+python scripts/generate_eval_video.py \
+  --checkpoint checkpoints/suturing_expert_lora/step_1480.pt \
+  --data_root  ./data/gdrive_cache \
+  --num_frames 60 --frame_step 6 --num_inference_steps 20
 ```
 
-On first run with `oauth_flow: console`, the script prints a Google consent URL in
-terminal; open it manually in your browser and complete consent. The refresh token
-is saved at `./secrets/google_token.json` and reused on later runs.
+Or launch the interactive comparison app:
 
-By default, discovered Drive files are cached locally under `./data/gdrive_cache`
-so downstream scripts can read normal file paths from `trial_index.csv`.
+```bash
+streamlit run scripts/streamlit_compare.py
+```
 
-Fallback mode is still supported by setting `ingestion.source: local` and pointing
-`paths.data_root` to a local dataset mirror.
+### 4. Sanity-check the stack
+
+```bash
+python scripts/diagnose_vae.py \
+  --data_root ./data/gdrive_cache --num_samples 6 --image_size 256
+
+python scripts/overfit_one_frame.py \
+  --data_root ./data/gdrive_cache --steps 500 \
+  --snapshot_steps 50,100,250,500
+```
+
+## Design Notes
+
+**Why replace the text encoder.** JIGSAWS kinematics are dense,
+continuous, and have a fixed 76-dim layout per timestep. Routing them
+through CLIP text tokens would lose precision and waste the cross-attn
+bandwidth. The `KinematicEncoder` is a 3-layer MLP that produces a
+full `[77, 768]` sequence directly; the gesture label is added to
+token 0 and the result is layer-normed.
+
+**Why LoRA on cross-attn.** The base SD weights already know how to
+turn latents into images; we only need to re-route *what* the U-Net
+attends to. LoRA on `to_q/to_k/to_v/to_out.0` keeps ~1% of parameters
+trainable and gives per-trial checkpoints small enough to ship inside
+a `.pt` file alongside encoder + scaler + vocab.
+
+**Why the VAE stays frozen.** The VAE reconstruction ceiling
+(`diagnose_vae.py`) shows that the frozen SD 1.5 VAE can already round-
+trip JIGSAWS suturing frames at roughly PSNR ~24–27 dB, which is above
+what the current generator reaches. Fine-tuning the VAE is on the
+roadmap but is not the limiting factor today.
+
+**Temporal consistency.** Training is per-frame; there is no temporal
+loss. `generate_eval_video.py` therefore uses a **fixed-seed** noise
+latent across frames by default, which empirically gives the most
+coherent playback. A diffusion-level temporal prior (e.g. AnimateDiff
+or SVD) is the obvious next step.
+
+## Google Drive OAuth Setup
+
+1. Place your OAuth client secret at
+   `./secrets/google_oauth_client.json`.
+2. Keep `configs/base.yaml` as-is, or set:
+   - `ingestion.source: gdrive`
+   - `ingestion.gdrive.credentials_path: ./secrets/google_oauth_client.json`
+   - `ingestion.gdrive.oauth_flow: console` (prints consent URL in
+     terminal; no auto-open)
+   - `ingestion.gdrive.root_folder_id: <JIGSAWS folder id>`
+   - `ingestion.gdrive.materialize_local: true` to cache discovered
+     files locally
+3. Run `python scripts/download_jigsaws.py` (or `prepare_trials.py` if
+   you want an indexed CSV of trials).
+
+The first run prints a Google consent URL; open it manually. The
+refresh token is saved to `./secrets/google_token.json` and reused on
+later runs. `ingestion.source: local` is still honoured if you mirror
+JIGSAWS to disk yourself.
 
 ## Data Expectations
 
-This project expects each trial to provide:
+Each Suturing trial must provide:
 
-- `capture1` and/or `capture2` video
-- kinematics file sampled at fixed rate (30 Hz for JIGSAWS)
-- transcription/gesture timing file
+- `capture1.avi` and/or `capture2.avi`
+- JIGSAWS kinematics file sampled at 30 Hz
+- transcription / gesture timing file
+- the standard `Experimental_setup/.../onetrialout/` split files
+- `meta_file_Suturing.txt` (skill metadata, used by `--expert_only`)
 
-`prepare_trials.py` discovers and links these modalities into a unified trial index.
-For JIGSAWS-style layouts, discovery expects task folders containing `video/`,
-`kinematics/`, and `transcription/` subfolders.
+`JIGSAWSDataset` lazily opens video via OpenCV, normalises kinematics
+with a `StandardScaler` fitted at init, and serialises scaler +
+gesture vocab alongside every checkpoint.
 
-## Current Scope
+## Current Status
 
-The baseline extraction from the original notebook includes:
+Working:
 
-- video metadata/frame extraction utilities
-- YOLO detector wrapper + classical motion fallback detector
-- detection export helpers (frames/crops/metadata)
-- sequence dataset/model components for temporal prediction
+- End-to-end kinematic-conditioned frame generation for JIGSAWS
+  Suturing.
+- LoRA training on Colab GPU, inference on CUDA / MPS / CPU.
+- Real-vs-generated grids, gesture sweeps, clip comparisons, metrics
+  board, Streamlit demo.
+- VAE-ceiling and one-frame-overfit diagnostics.
 
-The ControlNet/SVD integration is intentionally scaffolded and ready to connect to your trained models.
+Not yet / scaffolded only:
+
+- ControlNet and SVD hookups (`scripts/run_synthesis.py`,
+  `src/suturing_pipeline/synthesis/controlnet_pipeline.py`) are stubs
+  from the earlier baseline and are not wired to the trained
+  checkpoints.
+- YOLO detector branch is independent of the generator and is kept for
+  downstream analysis.
+- No temporal loss during training; multi-frame coherence relies on
+  fixed-seed sampling.
