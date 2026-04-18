@@ -308,6 +308,67 @@ _PREVIEW_CACHE_VERSION = "v2-h264"
 
 
 @st.cache_data(show_spinner=False)
+def transcode_generated_to_h264(
+    src_path_str: str,
+    mtime_ns: int,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Re-encode a generated MP4 (written by OpenCV with the ``mp4v``
+    fourcc = MPEG-4 Part 2) into browser-friendly H.264 and cache it.
+
+    ``st.video`` / Chrome / Safari refuse to play ``mp4v``, so every
+    generated clip needs this pass before display.  The encode is fast
+    (a few seconds for short clips) and the result is cached keyed on
+    the source mtime, so subsequent reruns are instant.
+
+    Returns ``(h264_path, error_message)``. Exactly one will be None.
+    """
+    src_path = Path(src_path_str)
+    if not src_path.exists() or src_path.stat().st_size < 1024:
+        return None, f"Source missing or empty: {src_path}"
+
+    ffmpeg = _resolve_ffmpeg()
+    if ffmpeg is None:
+        return None, (
+            "No ffmpeg binary found. Install system ffmpeg (`brew install "
+            "ffmpeg`) or `pip install imageio-ffmpeg`."
+        )
+
+    PREVIEW_CACHE.mkdir(parents=True, exist_ok=True)
+    key = (
+        f"gen_{slugify(src_path.parent.name)}_{slugify(src_path.stem)}"
+        f"_{mtime_ns}_{_PREVIEW_CACHE_VERSION}.mp4"
+    )
+    out_path = PREVIEW_CACHE / key
+    if out_path.exists() and out_path.stat().st_size > 1024:
+        return str(out_path), None
+
+    cmd = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-i", str(src_path),
+        "-an",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, check=False
+        )
+    except FileNotFoundError as e:
+        return None, f"ffmpeg invocation failed: {e}"
+
+    if proc.returncode != 0 or not out_path.exists() or out_path.stat().st_size < 1024:
+        out_path.unlink(missing_ok=True)
+        stderr = (proc.stderr or proc.stdout or "").strip().splitlines()
+        tail = "\n".join(stderr[-8:]) if stderr else "(no stderr)"
+        return None, f"ffmpeg transcode failed (rc={proc.returncode}):\n{tail}"
+    return str(out_path), None
+
+
+@st.cache_data(show_spinner=False)
 def transcode_for_preview(
     avi_path_str: str,
     mtime_ns: int,
@@ -503,7 +564,116 @@ def render_video(path: Path, caption: str) -> None:
         st.warning(f"{caption}: not produced (`{path.name}` missing or tiny).")
         return
     st.caption(caption)
-    st.video(str(path))
+    h264_path, err = transcode_generated_to_h264(
+        str(path), path.stat().st_mtime_ns
+    )
+    if h264_path is None:
+        st.warning(
+            f"Couldn't transcode `{path.name}` for in-browser preview "
+            f"({err}). The original file is on disk — use the download "
+            "button below to view it in a local player."
+        )
+        with open(path, "rb") as f:
+            st.download_button(
+                f"Download {path.name}",
+                data=f.read(),
+                file_name=path.name,
+                mime="video/mp4",
+                key=f"dl_raw_{path}",
+            )
+        return
+    st.video(h264_path)
+
+
+@st.cache_data(show_spinner=False, ttl=15)
+def scan_existing_runs() -> List[Dict[str, object]]:
+    """List every run directory under ``OUTPUT_ROOT`` that has at least
+    one playable artefact, newest first.
+
+    Used by the "Load previous run" selector so a user who reruns
+    Streamlit can revisit an already-generated clip without paying the
+    multi-hour render cost again.
+    """
+    out: List[Dict[str, object]] = []
+    if not OUTPUT_ROOT.is_dir():
+        return out
+    for run_dir in OUTPUT_ROOT.iterdir():
+        if not run_dir.is_dir() or run_dir.name.startswith("_"):
+            continue
+        side = run_dir / "sidebyside.mp4"
+        gen = run_dir / "generated.mp4"
+        real = run_dir / "real.mp4"
+        meta = run_dir / "metadata.json"
+        # Playable = file exists and isn't the ~44-byte zero-frame husk.
+        has_any = any(
+            p.exists() and p.stat().st_size > 1024
+            for p in (side, gen, real)
+        )
+        if not has_any:
+            continue
+        out.append(
+            {
+                "name": run_dir.name,
+                "dir": str(run_dir),
+                "mtime": run_dir.stat().st_mtime,
+                "has_side": side.exists() and side.stat().st_size > 1024,
+                "has_gen": gen.exists() and gen.stat().st_size > 1024,
+                "has_real": real.exists() and real.stat().st_size > 1024,
+                "has_meta": meta.exists(),
+            }
+        )
+    out.sort(key=lambda r: r["mtime"], reverse=True)
+    return out
+
+
+def render_previous_run(run_info: Dict[str, object], fps_hint: float) -> None:
+    """Render all artefacts of an already-completed run (video previews,
+    metrics board, metadata).  Used to let the user resurrect a run
+    after a Streamlit restart without regenerating anything.
+    """
+    run_dir = Path(str(run_info["dir"]))
+    side_path = run_dir / "sidebyside.mp4"
+    gen_path = run_dir / "generated.mp4"
+    real_path = run_dir / "real.mp4"
+    meta_path = run_dir / "metadata.json"
+
+    st.caption(
+        f"Run directory: `{run_dir.relative_to(REPO_ROOT)}`  \n"
+        f"Last modified: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(run_info['mtime'])))}"
+    )
+
+    render_video(side_path, "Side-by-side (REAL | GEN)")
+
+    sub_a, sub_b = st.columns(2)
+    with sub_a:
+        render_video(real_path, "Real (resampled)")
+    with sub_b:
+        render_video(gen_path, "Generated")
+
+    if real_path.exists() and gen_path.exists():
+        try:
+            render_metrics_board(real_path, gen_path, fps_hint=float(fps_hint))
+        except Exception as e:  # pragma: no cover - defensive UI path
+            st.info(f"Metrics board unavailable: {e}")
+
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+        except json.JSONDecodeError:
+            meta = None
+        if meta:
+            with st.expander("Run metadata", expanded=False):
+                st.json(meta)
+
+    if side_path.exists() and side_path.stat().st_size > 1024:
+        with open(side_path, "rb") as f:
+            st.download_button(
+                "Download side-by-side MP4",
+                data=f.read(),
+                file_name=f"{run_info['name']}_sidebyside.mp4",
+                mime="video/mp4",
+                key=f"dl_side_prev_{run_info['name']}",
+            )
 
 
 @st.cache_data(show_spinner=False)
@@ -801,7 +971,9 @@ def main() -> None:
         )
 
         with st.expander("Advanced settings", expanded=False):
-            fps_out = st.slider("Playback FPS", 2.0, 15.0, 5.0, 0.5)
+            fps_out = st.slider(
+                "Playback FPS", 2.0, 15.0, 5.0, 0.5, key="fps_out"
+            )
             num_inference_steps = st.slider(
                 "Diffusion steps", 10, 50, 20, 1,
                 help="More steps = sharper but slower.",
@@ -821,6 +993,52 @@ def main() -> None:
                 "Init strength", 0.3, 1.0, 0.7, 0.05,
                 help="1.0 = pure noise (no anchor). Lower = stronger temporal coherence.",
             )
+
+    existing_runs = scan_existing_runs()
+    if existing_runs:
+        default_expanded = st.session_state.get(
+            "_prev_run_expander_open", False
+        )
+        with st.expander(
+            f"Load a previously generated run ({len(existing_runs)} available)",
+            expanded=default_expanded,
+        ):
+            st.caption(
+                "Pick any completed run in `outputs/eval_video/streamlit_runs/` "
+                "to replay it here.  Nothing is regenerated — the videos on "
+                "disk are just transcoded to H.264 for in-browser preview "
+                "(takes seconds, cached afterwards)."
+            )
+            run_labels = [
+                f"{r['name']}  "
+                f"({time.strftime('%Y-%m-%d %H:%M', time.localtime(float(r['mtime'])))})"
+                for r in existing_runs
+            ]
+            prev_idx = st.selectbox(
+                "Previous run",
+                options=list(range(len(existing_runs))),
+                index=0,
+                format_func=lambda i: run_labels[i],
+                key="_prev_run_idx",
+            )
+            if st.button(
+                "Show this run",
+                key="_prev_run_show",
+                use_container_width=True,
+            ):
+                st.session_state["_prev_run_expander_open"] = True
+                st.session_state["_prev_run_active"] = existing_runs[prev_idx]
+
+        active_prev = st.session_state.get("_prev_run_active")
+        if active_prev is not None:
+            st.divider()
+            st.subheader(f"Previously generated: {active_prev['name']}")
+            # Use the current sidebar fps_out as a hint; it only affects the
+            # metrics-board timeline axis, not the video decoding.
+            render_previous_run(
+                active_prev, fps_hint=float(st.session_state.get("fps_out", 5.0))
+            )
+            st.divider()
 
     col_real, col_gen = st.columns(2)
 
