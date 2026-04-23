@@ -475,6 +475,7 @@ def run_generation(
     tts_provider: str,
     tts_voice: str,
     narrate_sidebyside: bool,
+    narration_default_outputs: bool,
 ) -> Tuple[int, Path]:
     """Invoke ``scripts/generate_eval_video.py`` and stream its stdout into
     the given streamlit container, updating ``progress_bar`` / ``eta_text``
@@ -516,6 +517,8 @@ def run_generation(
         )
         if narrate_sidebyside:
             cmd.append("--narrate_sidebyside")
+        if narration_default_outputs:
+            cmd.append("--narration_default_outputs")
 
     log_container.code(" ".join(cmd), language="bash")
     live = log_container.empty()
@@ -579,7 +582,7 @@ def run_generation(
     return proc.returncode, out_dir
 
 
-def render_video(path: Path, caption: str) -> None:
+def render_video(path: Path, caption: str, keep_audio: bool = False) -> None:
     if not path.exists() or path.stat().st_size < 1024:
         st.warning(f"{caption}: not produced (`{path.name}` missing or tiny).")
         return
@@ -587,7 +590,7 @@ def render_video(path: Path, caption: str) -> None:
     h264_path, err = transcode_generated_to_h264(
         str(path),
         path.stat().st_mtime_ns,
-        keep_audio=path.name.endswith("_narrated.mp4"),
+        keep_audio=keep_audio,
     )
     if h264_path is None:
         st.warning(
@@ -674,12 +677,30 @@ def render_previous_run(run_info: Dict[str, object], fps_hint: float) -> None:
 
     selected_side = side_narrated_path if side_narrated_path.exists() else side_path
     selected_gen = gen_narrated_path if gen_narrated_path.exists() else gen_path
+    meta = None
+    narration_default_outputs = False
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+        except json.JSONDecodeError:
+            meta = None
+        if isinstance(meta, dict):
+            narration_default_outputs = bool(
+                ((meta.get("narration") or {}).get("default_outputs_narrated"))
+            )
+    side_has_audio = selected_side == side_narrated_path or (
+        narration_default_outputs and selected_side == side_path
+    )
+    gen_has_audio = selected_gen == gen_narrated_path or (
+        narration_default_outputs and selected_gen == gen_path
+    )
 
     render_video(
         selected_side,
         "Side-by-side (REAL | GEN + narration)"
-        if selected_side == side_narrated_path
+        if side_has_audio
         else "Side-by-side (REAL | GEN)",
+        keep_audio=side_has_audio,
     )
 
     sub_a, sub_b = st.columns(2)
@@ -688,7 +709,8 @@ def render_previous_run(run_info: Dict[str, object], fps_hint: float) -> None:
     with sub_b:
         render_video(
             selected_gen,
-            "Generated + narration" if selected_gen == gen_narrated_path else "Generated",
+            "Generated + narration" if gen_has_audio else "Generated",
+            keep_audio=gen_has_audio,
         )
 
     if real_path.exists() and gen_path.exists():
@@ -697,14 +719,9 @@ def render_previous_run(run_info: Dict[str, object], fps_hint: float) -> None:
         except Exception as e:  # pragma: no cover - defensive UI path
             st.info(f"Metrics board unavailable: {e}")
 
-    if meta_path.exists():
-        try:
-            meta = json.loads(meta_path.read_text())
-        except json.JSONDecodeError:
-            meta = None
-        if meta:
-            with st.expander("Run metadata", expanded=False):
-                st.json(meta)
+    if meta:
+        with st.expander("Run metadata", expanded=False):
+            st.json(meta)
 
     if selected_side.exists() and selected_side.stat().st_size > 1024:
         with open(selected_side, "rb") as f:
@@ -1057,6 +1074,12 @@ def main() -> None:
                 value=True,
                 disabled=not enable_narration,
             )
+            narration_default_outputs = st.checkbox(
+                "Narrate default outputs (overwrite generated.mp4 / sidebyside.mp4)",
+                value=True,
+                disabled=not enable_narration,
+                help="If disabled, narrated copies are written as *_narrated.mp4 instead.",
+            )
 
     existing_runs = scan_existing_runs()
     if existing_runs:
@@ -1259,6 +1282,7 @@ def main() -> None:
                 tts_provider=str(tts_provider),
                 tts_voice=str(tts_voice),
                 narrate_sidebyside=bool(narrate_sidebyside),
+                narration_default_outputs=bool(narration_default_outputs),
             )
         dt = time.time() - t0
         if rc != 0:
@@ -1278,15 +1302,31 @@ def main() -> None:
             real_path = out_dir / "real.mp4"
             meta_path = out_dir / "metadata.json"
 
-            selected_side = (
-                side_narrated_path if side_narrated_path.exists() else side_path
-            )
+            meta = None
+            narration_default_outputs_meta = False
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text())
+                except json.JSONDecodeError:
+                    meta = None
+                if isinstance(meta, dict):
+                    narration_default_outputs_meta = bool(
+                        ((meta.get("narration") or {}).get("default_outputs_narrated"))
+                    )
+            selected_side = side_narrated_path if side_narrated_path.exists() else side_path
             selected_gen = gen_narrated_path if gen_narrated_path.exists() else gen_path
+            side_has_audio = selected_side == side_narrated_path or (
+                narration_default_outputs_meta and selected_side == side_path
+            )
+            gen_has_audio = selected_gen == gen_narrated_path or (
+                narration_default_outputs_meta and selected_gen == gen_path
+            )
             render_video(
                 selected_side,
                 "Side-by-side (REAL | GEN + narration)"
-                if selected_side == side_narrated_path
+                if side_has_audio
                 else "Side-by-side (REAL | GEN)",
+                keep_audio=side_has_audio,
             )
 
             sub_a, sub_b = st.columns(2)
@@ -1295,22 +1335,16 @@ def main() -> None:
             with sub_b:
                 render_video(
                     selected_gen,
-                    "Generated + narration"
-                    if selected_gen == gen_narrated_path
-                    else "Generated",
+                    "Generated + narration" if gen_has_audio else "Generated",
+                    keep_audio=gen_has_audio,
                 )
 
             if real_path.exists() and gen_path.exists():
                 render_metrics_board(real_path, gen_path, fps_hint=float(fps_out))
 
-            if meta_path.exists():
-                try:
-                    meta = json.loads(meta_path.read_text())
-                except json.JSONDecodeError:
-                    meta = None
-                if meta:
-                    with st.expander("Run metadata", expanded=False):
-                        st.json(meta)
+            if meta:
+                with st.expander("Run metadata", expanded=False):
+                    st.json(meta)
 
             with open(selected_side, "rb") as f:
                 st.download_button(
