@@ -205,6 +205,24 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also mux narration onto sidebyside.mp4 when it is produced.",
     )
+    p.add_argument(
+        "--narration_default_outputs",
+        action="store_true",
+        help=(
+            "Mux narration directly into generated.mp4 (and sidebyside.mp4 "
+            "when --narrate_sidebyside is set) instead of creating "
+            "*_narrated.mp4 copies."
+        ),
+    )
+    p.add_argument(
+        "--allow_narration_failure",
+        action="store_true",
+        help=(
+            "When narration is enabled, continue even if TTS/mux fails. "
+            "By default, narration failures stop the run so silent outputs "
+            "do not look like success."
+        ),
+    )
 
     # Temporal anchoring (Tier-1 coherence controls).
     p.add_argument(
@@ -568,6 +586,7 @@ def main() -> None:
         )
 
     narration_info: Dict[str, object] = {"enabled": bool(args.enable_narration)}
+    narration_failure: Optional[str] = None
     if args.enable_narration:
         print("Building narration segments ...")
         expert_stats: Dict[str, Dict[str, float]] = {}
@@ -633,27 +652,56 @@ def main() -> None:
                 voice=args.tts_voice,
                 min_segment_seconds=args.narration_min_segment_sec,
             )
-            generated_narrated = out_dir / "generated_narrated.mp4"
-            mux_audio_to_video(
-                video_path=out_dir / "generated.mp4",
-                audio_path=audio_path,
-                output_path=generated_narrated,
-            )
             narration_info["audio_path"] = str(audio_path)
-            narration_info["generated_narrated_path"] = str(generated_narrated)
             narration_info["tts"] = tts_info
-            print(f"  wrote {generated_narrated}")
-            if args.narrate_sidebyside and not args.no_sidebyside:
-                side_narrated = out_dir / "sidebyside_narrated.mp4"
+
+            if args.narration_default_outputs:
+                generated_target = out_dir / "generated.mp4"
+                generated_tmp = out_dir / "generated._tmp_narrated.mp4"
                 mux_audio_to_video(
-                    video_path=out_dir / "sidebyside.mp4",
+                    video_path=generated_target,
                     audio_path=audio_path,
-                    output_path=side_narrated,
+                    output_path=generated_tmp,
                 )
-                narration_info["sidebyside_narrated_path"] = str(side_narrated)
-                print(f"  wrote {side_narrated}")
+                generated_tmp.replace(generated_target)
+                narration_info["generated_narrated_path"] = str(generated_target)
+                narration_info["default_outputs_narrated"] = True
+                print(f"  wrote {generated_target} (with narration)")
+            else:
+                generated_narrated = out_dir / "generated_narrated.mp4"
+                mux_audio_to_video(
+                    video_path=out_dir / "generated.mp4",
+                    audio_path=audio_path,
+                    output_path=generated_narrated,
+                )
+                narration_info["generated_narrated_path"] = str(generated_narrated)
+                narration_info["default_outputs_narrated"] = False
+                print(f"  wrote {generated_narrated}")
+
+            if args.narrate_sidebyside and not args.no_sidebyside:
+                if args.narration_default_outputs:
+                    side_target = out_dir / "sidebyside.mp4"
+                    side_tmp = out_dir / "sidebyside._tmp_narrated.mp4"
+                    mux_audio_to_video(
+                        video_path=side_target,
+                        audio_path=audio_path,
+                        output_path=side_tmp,
+                    )
+                    side_tmp.replace(side_target)
+                    narration_info["sidebyside_narrated_path"] = str(side_target)
+                    print(f"  wrote {side_target} (with narration)")
+                else:
+                    side_narrated = out_dir / "sidebyside_narrated.mp4"
+                    mux_audio_to_video(
+                        video_path=out_dir / "sidebyside.mp4",
+                        audio_path=audio_path,
+                        output_path=side_narrated,
+                    )
+                    narration_info["sidebyside_narrated_path"] = str(side_narrated)
+                    print(f"  wrote {side_narrated}")
         except Exception as e:
-            narration_info["error"] = str(e)
+            narration_failure = str(e)
+            narration_info["error"] = narration_failure
             print(f"  WARN: narration synthesis/mux failed: {e}")
 
     metadata = {
@@ -696,6 +744,12 @@ def main() -> None:
     meta_path = out_dir / "metadata.json"
     meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Wrote {meta_path}")
+    if args.enable_narration and narration_failure and not args.allow_narration_failure:
+        raise SystemExit(
+            "Narration was enabled but failed; aborting to avoid silent outputs. "
+            "See metadata['narration']['error'] for details, or rerun with "
+            "--allow_narration_failure to keep video-only artefacts."
+        )
     print(
         f"Done. {len(per_frame_records)} frames in "
         f"{total_gen_time:.1f}s "
