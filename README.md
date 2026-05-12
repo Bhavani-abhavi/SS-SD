@@ -17,7 +17,7 @@ gesture id (int)     ─┘                                          ▲
                                                                  │
                                                          noisy latent + timestep
 ```
-
+####
 Only the JIGSAWS `Suturing` task is supported. The other JIGSAWS tasks
 do not ship aligned kinematics usable by this pipeline.
 
